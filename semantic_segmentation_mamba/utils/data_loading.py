@@ -64,10 +64,18 @@ class BasicDataset(Dataset):
         """ Return length of dataset."""
         return len(self.ids)
 
+    @staticmethod
+    def label_candidates(name: str):
+        candidates = [name]
+        if name.endswith("_sat"):
+            candidates.append(name[:-4] + "_mask")
+        return candidates
+
     @classmethod
     def label_preprocess(cls, label):
         """ Binaryzation label."""
-
+        if label.ndim == 3:
+            label = label[..., 0]
         label[label != 0] = 1
         return label
 
@@ -100,7 +108,11 @@ class BasicDataset(Dataset):
 
         name = self.ids[idx]
         img_file = list(self.images_dir.glob(name + '.*'))
-        label_file = list(self.labels_dir.glob(name + '.*'))
+        label_file = []
+        for candidate in self.label_candidates(name):
+            label_file = list(self.labels_dir.glob(candidate + '.*'))
+            if label_file:
+                break
 
         assert len(label_file) == 1, f'Either no label or multiple labels found for the ID {name}: {label_file}'
         assert len(img_file) == 1, f'Either no image or multiple images found for the ID {name}: {img_file}'

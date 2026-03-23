@@ -11,29 +11,36 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from einops import rearrange, repeat
-from timm.models.layers import DropPath, trunc_normal_
+from timm.layers import DropPath, trunc_normal_
 from fvcore.nn import FlopCountAnalysis, flop_count_str, flop_count, parameter_count
 DropPath.__repr__ = lambda self: f"timm.DropPath({self.drop_prob})"
+
+if hasattr(torch, "amp") and hasattr(torch.amp, "custom_fwd") and hasattr(torch.amp, "custom_bwd"):
+    custom_fwd = partial(torch.amp.custom_fwd, device_type="cuda")
+    custom_bwd = partial(torch.amp.custom_bwd, device_type="cuda")
+else:
+    custom_fwd = torch.cuda.amp.custom_fwd
+    custom_bwd = torch.cuda.amp.custom_bwd
 
 # import selective scan ==============================
 try:
     import selective_scan_cuda_oflex
 except Exception as e:
-    ...
+    selective_scan_cuda_oflex = None
     # print(f"WARNING: can not import selective_scan_cuda_oflex.", flush=True)
     # print(e, flush=True)
 
 try:
     import selective_scan_cuda_core
 except Exception as e:
-    ...
+    selective_scan_cuda_core = None
     # print(f"WARNING: can not import selective_scan_cuda_core.", flush=True)
     # print(e, flush=True)
 
 try:
     import selective_scan_cuda
 except Exception as e:
-    ...
+    selective_scan_cuda = None
     # print(f"WARNING: can not import selective_scan_cuda.", flush=True)
     # print(e, flush=True)
 
@@ -127,7 +134,7 @@ def print_jit_input_names(inputs):
 class SelectiveScanMamba(torch.autograd.Function):
     # comment all checks if inside cross_selective_scan
     @staticmethod
-    @torch.cuda.amp.custom_fwd
+    @custom_fwd
     def forward(ctx, u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=False, nrows=1, backnrows=1, oflex=True):
         # assert nrows in [1, 2, 3, 4], f"{nrows}" # 8+ is too slow to compile
         # assert u.shape[1] % (B.shape[1] * nrows) == 0, f"{nrows}, {u.shape}, {B.shape}"
@@ -155,7 +162,7 @@ class SelectiveScanMamba(torch.autograd.Function):
         return out
     
     @staticmethod
-    @torch.cuda.amp.custom_bwd
+    @custom_bwd
     def backward(ctx, dout, *args):
         u, delta, A, B, C, D, delta_bias, x = ctx.saved_tensors
         if dout.stride(-1) != 1:
@@ -173,7 +180,7 @@ class SelectiveScanMamba(torch.autograd.Function):
 class SelectiveScanCore(torch.autograd.Function):
     # comment all checks if inside cross_selective_scan
     @staticmethod
-    @torch.cuda.amp.custom_fwd
+    @custom_fwd
     def forward(ctx, u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=False, nrows=1, backnrows=1, oflex=True):
         ctx.delta_softplus = delta_softplus
         out, x, *rest = selective_scan_cuda_core.fwd(u, delta, A, B, C, D, delta_bias, delta_softplus, 1)
@@ -181,7 +188,7 @@ class SelectiveScanCore(torch.autograd.Function):
         return out
     
     @staticmethod
-    @torch.cuda.amp.custom_bwd
+    @custom_bwd
     def backward(ctx, dout, *args):
         u, delta, A, B, C, D, delta_bias, x = ctx.saved_tensors
         if dout.stride(-1) != 1:
@@ -195,7 +202,7 @@ class SelectiveScanCore(torch.autograd.Function):
 class SelectiveScanOflex(torch.autograd.Function):
     # comment all checks if inside cross_selective_scan
     @staticmethod
-    @torch.cuda.amp.custom_fwd
+    @custom_fwd
     def forward(ctx, u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=False, nrows=1, backnrows=1, oflex=True):
         ctx.delta_softplus = delta_softplus
         out, x, *rest = selective_scan_cuda_oflex.fwd(u, delta, A, B, C, D, delta_bias, delta_softplus, 1, oflex)
@@ -203,7 +210,7 @@ class SelectiveScanOflex(torch.autograd.Function):
         return out
     
     @staticmethod
-    @torch.cuda.amp.custom_bwd
+    @custom_bwd
     def backward(ctx, dout, *args):
         u, delta, A, B, C, D, delta_bias, x = ctx.saved_tensors
         if dout.stride(-1) != 1:
@@ -217,7 +224,7 @@ class SelectiveScanOflex(torch.autograd.Function):
 class SelectiveScanFake(torch.autograd.Function):
     # comment all checks if inside cross_selective_scan
     @staticmethod
-    @torch.cuda.amp.custom_fwd
+    @custom_fwd
     def forward(ctx, u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=False, nrows=1, backnrows=1, oflex=True):
         ctx.delta_softplus = delta_softplus
         ctx.backnrows = backnrows
@@ -227,13 +234,29 @@ class SelectiveScanFake(torch.autograd.Function):
         return out
     
     @staticmethod
-    @torch.cuda.amp.custom_bwd
+    @custom_bwd
     def backward(ctx, dout, *args):
         u, delta, A, B, C, D, delta_bias, x = ctx.saved_tensors
         if dout.stride(-1) != 1:
             dout = dout.contiguous()
-        du, ddelta, dA, dB, dC, dD, ddelta_bias = u * 0, delta * 0, A * 0, B * 0, C * 0, C * 0, (D * 0 if D else None), (delta_bias * 0 if delta_bias else None)
+        du = u * 0
+        ddelta = delta * 0
+        dA = A * 0
+        dB = B * 0
+        dC = C * 0
+        dD = D * 0 if D is not None else None
+        ddelta_bias = delta_bias * 0 if delta_bias is not None else None
         return (du, ddelta, dA, dB, dC, dD, ddelta_bias, None, None, None, None)
+
+
+def get_default_selective_scan():
+    if selective_scan_cuda_oflex is not None:
+        return SelectiveScanOflex
+    if selective_scan_cuda_core is not None:
+        return SelectiveScanCore
+    if selective_scan_cuda is not None:
+        return SelectiveScanMamba
+    return SelectiveScanFake
 
 # =============
 def antidiagonal_gather(tensor):
@@ -645,21 +668,22 @@ class OSSM(nn.Module):
             self.out_norm = nn.LayerNorm(d_inner)
 
         # forward_type debug =======================================
+        default_selective_scan = get_default_selective_scan()
         FORWARD_TYPES = dict(
             v0=self.forward_corev0,
             # v2=partial(self.forward_corev2, force_fp32=(not self.disable_force32), SelectiveScan=SelectiveScanCore),
-            v2=partial(self.forward_corev2, force_fp32=True, SelectiveScan=SelectiveScanCore),
-            v3=partial(self.forward_corev2, force_fp32=False, SelectiveScan=SelectiveScanOflex),
-            v31d=partial(self.forward_corev2, force_fp32=False, SelectiveScan=SelectiveScanOflex, cross_selective_scan=partial(
+            v2=partial(self.forward_corev2, force_fp32=True, SelectiveScan=default_selective_scan),
+            v3=partial(self.forward_corev2, force_fp32=False, SelectiveScan=SelectiveScanOflex if selective_scan_cuda_oflex is not None else default_selective_scan),
+            v31d=partial(self.forward_corev2, force_fp32=False, SelectiveScan=SelectiveScanOflex if selective_scan_cuda_oflex is not None else default_selective_scan, cross_selective_scan=partial(
                 cross_selective_scan, CrossScan=CrossScan_Ab_1direction, CrossMerge=CrossMerge_Ab_1direction,
             )),
-            v32d=partial(self.forward_corev2, force_fp32=False, SelectiveScan=SelectiveScanOflex, cross_selective_scan=partial(
+            v32d=partial(self.forward_corev2, force_fp32=False, SelectiveScan=SelectiveScanOflex if selective_scan_cuda_oflex is not None else default_selective_scan, cross_selective_scan=partial(
                 cross_selective_scan, CrossScan=CrossScan_Ab_2direction, CrossMerge=CrossMerge_Ab_2direction,
             )),
             # ===============================
             fake=partial(self.forward_corev2, force_fp32=(not self.disable_force32), SelectiveScan=SelectiveScanFake),
-            v1=partial(self.forward_corev2, force_fp32=True, SelectiveScan=SelectiveScanOflex),
-            v01=partial(self.forward_corev2, force_fp32=(not self.disable_force32), SelectiveScan=SelectiveScanMamba),
+            v1=partial(self.forward_corev2, force_fp32=True, SelectiveScan=SelectiveScanOflex if selective_scan_cuda_oflex is not None else default_selective_scan),
+            v01=partial(self.forward_corev2, force_fp32=(not self.disable_force32), SelectiveScan=SelectiveScanMamba if selective_scan_cuda is not None else default_selective_scan),
         )
         if forward_type.startswith("debug"):
             from .ss2d_ablations import SS2D_ForwardCoreSpeedAblations, SS2D_ForwardCoreModeAblations, cross_selective_scanv2

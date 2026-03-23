@@ -1,247 +1,214 @@
-from pathlib import Path
-import time
-import numpy as np
-import torch.nn.functional as F
-from utils.path_hyperparameter import ph
-import torch
 import logging
+import os
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
 from tqdm import tqdm
-import wandb
+
+from utils.path_hyperparameter import ph
 
 
+class BinarySegmentationMeter:
+    def __init__(self, threshold: float = 0.5, eps: float = 1e-7):
+        self.threshold = threshold
+        self.eps = eps
+        self.reset()
 
-def save_model(model, path, epoch, mode, optimizer=None):
-    """
-    Save best model when best metric appear in evaluation
-    or save checkpoint every specified interval in evaluation
+    def reset(self) -> None:
+        self.tp = 0.0
+        self.fp = 0.0
+        self.tn = 0.0
+        self.fn = 0.0
 
-    Parameter:
-        model(class): neural network we build
-        path(str): model saved path
-        epoch(int): model saved training epoch
-        mode(str): ensure either save best model or save checkpoint,
-            should be `checkpoint` or `loss` or `f1score`
+    def update(self, logits: torch.Tensor, labels: torch.Tensor) -> None:
+        probs = torch.sigmoid(logits)
+        preds = (probs >= self.threshold).long()
+        targets = (labels >= 0.5).long()
+        if targets.ndim == 3:
+            targets = targets.unsqueeze(1)
 
-    Return:
-        return nothing
-    """
-    # mode should be checkpoint or loss or f1score
-    Path(path).mkdir(parents=True,
-                     exist_ok=True)  # create a dictionary
-    # ipdb.set_trace()
-    localtime = time.asctime(time.localtime(time.time()))
-    if mode == 'checkpoint':
-        state_dict = {'net': model.state_dict(), 'optimizer': optimizer.state_dict()}
-        torch.save(state_dict,
-                   str(path + f'checkpoint_epoch{epoch}_{localtime}.pth'))
-    else:
-        torch.save(model.state_dict(), str(path + f'best_{mode}_epoch{epoch}_{localtime}.pth'))
-    logging.info(f'best {mode} model {epoch} saved at {localtime}!')
+        self.tp += torch.sum((preds == 1) & (targets == 1)).item()
+        self.fp += torch.sum((preds == 1) & (targets == 0)).item()
+        self.tn += torch.sum((preds == 0) & (targets == 0)).item()
+        self.fn += torch.sum((preds == 0) & (targets == 1)).item()
+
+    def compute(self):
+        precision = self.tp / (self.tp + self.fp + self.eps)
+        recall = self.tp / (self.tp + self.fn + self.eps)
+        f1 = 2 * precision * recall / (precision + recall + self.eps)
+        road_iou = self.tp / (self.tp + self.fp + self.fn + self.eps)
+        bg_iou = self.tn / (self.tn + self.fp + self.fn + self.eps)
+        miou = 0.5 * (road_iou + bg_iou)
+        accuracy = (self.tp + self.tn) / (self.tp + self.fp + self.tn + self.fn + self.eps)
+        return {
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "road_iou": road_iou,
+            "miou": miou,
+        }
 
 
-# parameter [warmup_lr, grad_scaler] is required in training
-# parameter [best_metrics, checkpoint_path, best_f1score_model_path, best_loss_model_path, non_improved_epoch]
-# is required in evaluation
+def save_model(model, path, epoch, mode, optimizer=None, metrics=None):
+    Path(path).mkdir(parents=True, exist_ok=True)
+    state_dict = {
+        "net": model.state_dict(),
+        "epoch": epoch + 1,
+        "mode": mode,
+    }
+    if optimizer is not None:
+        state_dict["optimizer"] = optimizer.state_dict()
+    if metrics is not None:
+        state_dict["metrics"] = metrics
+
+    filename = f"{mode}_epoch_{epoch + 1}.pth"
+    torch.save(state_dict, os.path.join(path, filename))
+    logging.info(f"Saved {mode} model at epoch {epoch + 1}")
+
+
 def train_val_test(
-        mode, dataset_name,
-        dataloader, device, log_wandb, net, optimizer, total_step,
-        lr, criterion, metric_collection, to_pilimg, epoch,
-        warmup_lr=None, grad_scaler=None,
-        best_metrics=None, checkpoint_path=None,
-        best_f1score_model_path=None, best_loss_model_path=None, non_improved_epoch=None
+    mode,
+    dataloader,
+    device,
+    writer,
+    net,
+    optimizer,
+    total_step,
+    lr,
+    criterion,
+    epoch,
+    warmup_lr=None,
+    grad_scaler=None,
+    best_metrics=None,
+    checkpoint_path=None,
 ):
-    """
-    train or evaluate on specified dataset,
-    notice that parameter [warmup_lr, grad_scaler] is required in training,
-    and parameter [best_metrics, checkpoint_path, best_f1score_model_path, best_loss_model_path,
-     non_improved_epoch] is required in evaluation
+    assert mode in ["train", "val"], "mode should be train or val"
 
-     Parameter:
-        mode(str): ensure whether train or evaluate,
-            should be `train` or `val`
-        dataset_name(str): name of specified dataset
-        dataloader(class): dataloader of corresponding mode and specified dataset
-        device(str): model running device
-        log_wandb(class): using this class to log hyperparameter, metric and output
-        net(class): neural network we build
-        optimizer(class): optimizer of training
-        total_step(int): training step
-        lr(float): learning rate
-        criterion(class): loss function
-        metric_collection(class): metric calculator
-        to_pilimg(function): function converting array to image
-        epoch(int): training epoch
-        warmup_lr(list): learning rate with corresponding step in warm up
-        grad_scaler(class): scale gradient when using amp
-        best_metrics(list): the best metrics in evaluation
-        checkpoint_path(str): checkpoint saved path
-        best_f1score_model_path(str): the best f1-score model saved path
-        best_loss_model_path(str): the best loss model saved path
-        non_improved_epoch(int): the best metric not increasing duration epoch
+    epoch_loss = 0.0
+    epoch_dice_loss = 0.0
+    epoch_bce_loss = 0.0
+    meter = BinarySegmentationMeter(threshold=ph.threshold)
 
-    Return:
-        return different changed input parameter in different mode,
-        when mode = `train`,
-        return log_wandb, net, optimizer, grad_scaler, total_step, lr,
-        when mode = `val`,
-        return log_wandb, net, optimizer, total_step, lr, best_metrics, non_improved_epoch
-    """
-    assert mode in ['train', 'val'], 'mode should be train, val'
-    epoch_loss = 0
-    # Begin Training/Evaluating
-    if mode == 'train':
+    if mode == "train":
         net.train()
     else:
         net.eval()
-    logging.info(f'SET model mode to {mode}!')
-    batch_iter = 0
+    logging.info(f"SET model mode to {mode}")
 
     tbar = tqdm(dataloader)
     n_iter = len(dataloader)
-    sample_batch = np.random.randint(low=0, high=n_iter)
+    sample_batch = np.random.randint(low=0, high=max(n_iter, 1))
+    sample_image = None
+    sample_label = None
+    sample_pred = None
 
-    for i, (image, labels, name) in enumerate(tbar):
-        tbar.set_description(
-            "epoch {} info ".format(epoch) + str(batch_iter) + " - " + str(batch_iter + ph.batch_size))
-        batch_iter = batch_iter + ph.batch_size
+    for i, (image, labels, _) in enumerate(tbar):
+        tbar.set_description(f"epoch {epoch + 1} {mode} {i + 1}/{n_iter}")
         total_step += 1
 
-        # Zero the gradient if train
-        if mode == 'train':
+        if mode == "train":
             optimizer.zero_grad()
-            # warm up
             if total_step < ph.warm_up_step:
-                for g in optimizer.param_groups:
-                    g['lr'] = warmup_lr[total_step]
+                for group in optimizer.param_groups:
+                    group["lr"] = float(warmup_lr[total_step])
 
-        image = image.float().to(device)
-        labels = labels.float().to(device)
+        image = image.float().to(device, non_blocking=True)
+        labels = labels.float().to(device, non_blocking=True)
 
-        # 按照特定的ratio对图像进行下采样
-        b,c,h,w = image.shape
-        image = F.interpolate(image, size=(h//ph.downsample_raito, w//ph.downsample_raito), mode='bilinear', align_corners=False)
-        labels = F.interpolate(labels.unsqueeze(1), size=(h//ph.downsample_raito, w//ph.downsample_raito), mode='bilinear', align_corners=False).squeeze(1)
+        b, c, h, w = image.shape
+        image = F.interpolate(
+            image,
+            size=(h // ph.downsample_raito, w // ph.downsample_raito),
+            mode="bilinear",
+            align_corners=False,
+        )
+        labels = F.interpolate(
+            labels.unsqueeze(1),
+            size=(h // ph.downsample_raito, w // ph.downsample_raito),
+            mode="nearest",
+        ).squeeze(1)
 
-
-        # 对图片按照设定的图像大小进行拆分
         crop_size = ph.image_size
-
-        # 使用unfold方法在H和W维度上提取小块
-        # unfold(dimension, size, step)沿着指定维度滑动窗口提取块
-        # 步长(step)等于块的大小意味着不会有重叠
         image_patches = image.unfold(2, crop_size, crop_size).unfold(3, crop_size, crop_size)
-        # patches的形状现在是[B, C, ratio, ratio, H/ratio, W/ratio]
-        # 调整形状以堆叠所有小块在batch维度上
-        # 首先，我们计算出新的batch大小，然后重新排列维度
-        B, C, new_H, new_W, _, _ = image_patches.size()
-        image = image_patches.permute(0, 2, 3, 1, 4, 5).reshape(-1, C, crop_size, crop_size).contiguous()
+        _, _, _, _, _, _ = image_patches.size()
+        image = image_patches.permute(0, 2, 3, 1, 4, 5).reshape(-1, c, crop_size, crop_size).contiguous()
 
-
-        # labels的形状为B,H,W, unfold之后形状为[B, ratio, ratio, H/ratio, W/ratio]
         labels_patches = labels.unfold(1, crop_size, crop_size).unfold(2, crop_size, crop_size)
         labels = labels_patches.reshape(-1, crop_size, crop_size).contiguous()
 
-        if mode == 'train':
-            # using amp
-            with torch.cuda.amp.autocast():
-                preds = net(image)
-                loss_change, diceloss, foclaloss = criterion(preds, labels)
-            cd_loss = loss_change.mean()
-            grad_scaler.scale(cd_loss).backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), 1, norm_type=2)
-            grad_scaler.step(optimizer)
-            grad_scaler.update()
-            
-            # # not using amp
-            # preds = net(image)
-            # loss_change, diceloss, foclaloss = criterion(preds, labels)
-            # cd_loss = loss_change.mean()
-            # optimizer.zero_grad()  
-            # cd_loss.backward()
-            # optimizer.step()
-        else:
+        with torch.cuda.amp.autocast(enabled=ph.amp and device.type == "cuda"):
             preds = net(image)
             loss_change, diceloss, foclaloss = criterion(preds, labels)
             cd_loss = loss_change.mean()
 
-        epoch_loss += cd_loss
-        preds = torch.sigmoid(preds)
+        if mode == "train":
+            grad_scaler.scale(cd_loss).backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), ph.max_norm, norm_type=2)
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
 
-        # log the t1_img, t2_img, pred and label
+        epoch_loss += cd_loss.item()
+        epoch_dice_loss += float(diceloss.item())
+        epoch_bce_loss += float(foclaloss.item())
+        meter.update(preds.detach(), labels.detach())
+
         if i == sample_batch:
             sample_index = np.random.randint(low=0, high=image.shape[0])
+            sample_image = image[sample_index].detach().cpu()
+            sample_label = labels[sample_index].detach().cpu().unsqueeze(0)
+            sample_pred = (torch.sigmoid(preds[sample_index]).detach().cpu() >= ph.threshold).float()
 
-            t1_img_log = torch.round(image[sample_index]).cpu().clone().float()
-            label_log = torch.round(labels[sample_index]).cpu().clone().float()
-            pred_log = torch.round(preds[sample_index]).cpu().clone().float()
+        batch_metrics = meter.compute()
+        writer.add_scalar(f"{mode}/step_loss", cd_loss.item(), total_step)
+        writer.add_scalar(f"{mode}/step_precision", batch_metrics["precision"], total_step)
+        writer.add_scalar(f"{mode}/step_recall", batch_metrics["recall"], total_step)
+        writer.add_scalar(f"{mode}/step_f1", batch_metrics["f1"], total_step)
+        writer.add_scalar(f"{mode}/step_miou", batch_metrics["miou"], total_step)
+        writer.add_scalar(f"{mode}/step_road_iou", batch_metrics["road_iou"], total_step)
+        if mode == "train":
+            writer.add_scalar("train/learning_rate", optimizer.param_groups[0]["lr"], total_step)
 
-        # print(f'pred shape:{preds.shape}, label shape:{labels.shape}')
-        batch_metrics = metric_collection.forward(preds.float(), labels.int().unsqueeze(1))  # compute metric
+    metrics = meter.compute()
+    metrics["loss"] = epoch_loss / max(n_iter, 1)
+    metrics["dice_loss"] = epoch_dice_loss / max(n_iter, 1)
+    metrics["bce_loss"] = epoch_bce_loss / max(n_iter, 1)
 
-        # log loss and metric
-        log_wandb.log({
-            f'{mode} loss': cd_loss,
-            f'{mode} accuracy': batch_metrics['accuracy'],
-            f'{mode} precision': batch_metrics['precision'],
-            f'{mode} recall': batch_metrics['recall'],
-            f'{mode} f1score': batch_metrics['f1score'],
-            'learning rate': optimizer.param_groups[0]['lr'],
-            f'{mode} loss_dice': diceloss,
-            f'{mode} loss_bce': foclaloss,
-            'step': total_step,
-            'epoch': epoch
-        })
+    logging.info(
+        f"{mode} epoch {epoch + 1}: "
+        f"loss={metrics['loss']:.6f}, "
+        f"miou={metrics['miou']:.6f}, "
+        f"road_iou={metrics['road_iou']:.6f}, "
+        f"precision={metrics['precision']:.6f}, "
+        f"recall={metrics['recall']:.6f}, "
+        f"f1={metrics['f1']:.6f}"
+    )
 
+    for key, value in metrics.items():
+        writer.add_scalar(f"{mode}/epoch_{key}", value, epoch + 1)
 
-        # clear batch variables from memory
-        del image, labels
+    if sample_image is not None:
+        writer.add_image(f"{mode}/image", sample_image, epoch + 1)
+        writer.add_image(f"{mode}/label", sample_label, epoch + 1)
+        writer.add_image(f"{mode}/prediction", sample_pred, epoch + 1)
 
-    epoch_metrics = metric_collection.compute()  # compute epoch metric
-    epoch_loss /= n_iter
-
-    print(f"{mode} f1score: {epoch_metrics['f1score']}")
-    print(f'{mode} epoch loss: {epoch_loss}')
-
-    for k in epoch_metrics.keys():
-        log_wandb.log({f'epoch_{mode}_{str(k)}': epoch_metrics[k],
-                       'epoch': epoch})  # log epoch metric
-    metric_collection.reset()
-    log_wandb.log({f'epoch_{mode}_loss': epoch_loss,
-                   'epoch': epoch})  # log epoch loss
-
-    log_wandb.log({
-        f'{mode} t1_images': wandb.Image(to_pilimg(t1_img_log)),
-        f'{mode} masks': {
-            'label': wandb.Image(to_pilimg(label_log)),
-            'pred': wandb.Image(to_pilimg(pred_log)),
-        },
-        'epoch': epoch
-    })  # log the t1_img, t2_img, pred and label
-
-    # save best model and adjust learning rate according to learning rate scheduler
-    if mode == 'val':
-        if epoch_metrics['f1score'] > best_metrics['best_f1score']:
-            non_improved_epoch = 0
-            best_metrics['best_f1score'] = epoch_metrics['f1score']
+    if mode == "val":
+        if metrics["road_iou"] > best_metrics["best_road_iou"]:
+            best_metrics["best_road_iou"] = metrics["road_iou"]
+            best_metrics["best_epoch"] = epoch + 1
             if ph.save_best_model:
-                save_model(net, best_f1score_model_path, epoch, 'f1score')
-        elif epoch_loss < best_metrics['lowest loss']:
-            best_metrics['lowest loss'] = epoch_loss
-            if ph.save_best_model:
-                save_model(net, best_loss_model_path, epoch, 'loss')
-        else:
-            non_improved_epoch += 1
-            if non_improved_epoch == ph.patience:
-                lr *= ph.factor
-                for g in optimizer.param_groups:
-                    g['lr'] = lr
-                non_improved_epoch = 0
+                save_model(net, checkpoint_path, epoch, "best_road_iou", optimizer=optimizer, metrics=metrics)
 
-        # save checkpoint every specified interval
+        if metrics["loss"] < best_metrics["lowest_loss"]:
+            best_metrics["lowest_loss"] = metrics["loss"]
+
         if (epoch + 1) % ph.save_interval == 0 and ph.save_checkpoint:
-            save_model(net, checkpoint_path, epoch, 'checkpoint', optimizer=optimizer)
+            save_model(net, checkpoint_path, epoch, "checkpoint", optimizer=optimizer, metrics=metrics)
 
-    if mode == 'train':
-        return log_wandb, net, optimizer, grad_scaler, total_step, lr
-    elif mode == 'val':
-        return log_wandb, net, optimizer, total_step, lr, best_metrics, non_improved_epoch
+        writer.add_scalar("val/best_road_iou", best_metrics["best_road_iou"], epoch + 1)
+
+    if mode == "train":
+        return net, optimizer, grad_scaler, total_step, lr, metrics
+    return net, optimizer, total_step, lr, best_metrics, None, metrics
